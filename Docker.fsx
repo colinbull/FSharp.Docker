@@ -12,6 +12,13 @@ module Docker =
     [<AutoOpen>]
     module Types =
 
+        type LogEntry = {
+            Timestamp : DateTimeOffset
+            Ordinal : int
+            Level : string
+            Message : string
+        }
+
         type Image = {
             Repository : string option
             Tag : string option
@@ -22,7 +29,7 @@ module Docker =
         }
 
     [<AutoOpen>]
-    module Patterns =
+    module internal Patterns =
 
         let endsWith pred (str:string) =
             pred |> List.exists (fun p -> str.EndsWith(p))
@@ -58,6 +65,11 @@ module Docker =
                 printfn "Trying to parse %A as date" s
                 DateTime.Parse(s)
 
+        let (|DateTimeOffset|_|) (str:string) =
+            match DateTimeOffset.TryParse(str.Trim()) with
+            | true, v -> Some v
+            | false, _ -> None
+        
         let (|SplitParseFirst|_|) (splitChar:char[]) f (inp:string) =
             match inp.Split(splitChar, StringSplitOptions.RemoveEmptyEntries) |> Array.toList with
             | value :: _ -> Some <|f value
@@ -66,17 +78,13 @@ module Docker =
     let mutable cmdTimeout = TimeSpan.FromSeconds(30.)
     let mutable workingDirectory = __SOURCE_DIRECTORY__
     let mutable machineEnvironment = None
-    
-    type ICommand =
-         abstract GetString : unit -> string
-    
+        
     let private assertMachineEnv() =
         match machineEnvironment with
         | None -> failwith "machine environment not set, have you created a machine?"
         | Some x -> x
         
-    let exec root cmd envs (options:#ICommand list) args =
-        let opts = options |> List.map (fun x -> x.GetString())
+    let dockerCmd root cmd envs opts args =
         let args =
             sprintf "%s %s" cmd (String.Join(" ",opts @ args))
         let ok, messages = 
@@ -88,15 +96,35 @@ module Docker =
             ) cmdTimeout
         messages |> Seq.map (fun m -> m.Message) |> Seq.toList
         
-    let execRequireMachine root cmd options args =
+    let dockerCmdRequireMachine root cmd options args =
         let envs = assertMachineEnv()
-        exec root cmd envs options args
+        dockerCmd root cmd envs options args
     
     let version() =
-        exec "docker" "--version" [] [] []
-        
-    let images() =
-        let (title::data) = execRequireMachine "docker" "images --digests=true -a" [] []
+        dockerCmd "docker" "--version" [] [] []
+
+    let logs options name =
+        let parseLine (str:string) =
+            let str = str.Trim()
+            match str.Split([|' '|], StringSplitOptions.RemoveEmptyEntries) |> Array.toList with
+            | (DateTimeOffset date) :: value :: level :: t ->
+                { Timestamp = date; Ordinal = Int32.Parse(value); Level = level; Message = (String.Join(" ", t)) }
+                |> Some  
+            | _ -> None
+        dockerCmdRequireMachine "docker" "logs" options [name]
+        |> List.choose parseLine
+
+    let build options dockerfile = 
+        dockerCmdRequireMachine "docker" "build" options [dockerfile]
+
+    let create options image command args =
+        dockerCmdRequireMachine "docker" "create" options [command;args]
+
+    let exec options container command args =
+        dockerCmdRequireMachine "docker" "exec" options [container; command; args]
+
+    let images options =
+        let (title::data) = dockerCmdRequireMachine "docker" "images" options []
         let indexes =
             ["REPOSITORY"; "TAG"; "DIGEST"; "IMAGE ID"; "CREATED"; "VIRTUAL SIZE"]
             |> Seq.map (title.IndexOf)
@@ -104,10 +132,9 @@ module Docker =
             |> Seq.filter ((<=) 0)
             |> Seq.pairwise
             |> Seq.toList
-        
+
         let parseLine (str:string) =
             let result =  indexes |> List.map (fun (x,y) -> str.Substring(x, (min (str.Length - 1) y) - x).Trim())
-            printfn "%A" result
             match result with
             | [StringOpt rep; StringOpt tag; StringOpt digst; image; Date created; SplitParseFirst [|' '|] float  size] ->
                 Some { Repository = rep; Digest = digst;  Tag = tag; ImageId = image; Created = created; VirtualSize = size }
@@ -118,18 +145,21 @@ module Docker =
         data
         |> List.choose parseLine
 
-    let removeImage images =
+    let removeImage options image =
+         dockerCmdRequireMachine "docker" "rmi" (options @ [image]) []
+        
+    let removeImages options images =
         [
             for image in images do
-                yield execRequireMachine "docker" (sprintf "rmi %s" image.ImageId) [] []
+                yield removeImage options image.ImageId
         ]
-        
-    let removeImagesMatching f =
-        images()
-        |> Seq.filter (fun x -> x.Repository.IsNone && x.Tag.IsNone)
-        |> removeImage
-        |> List.concat   
 
+    let removeImagesMatching options f =
+        images options
+        |> Seq.filter (fun x -> x.Repository.IsNone && x.Tag.IsNone)
+        |> removeImages options
+        |> List.concat   
+    
     module Machine =
 
         let [<Literal>] inspectJson = "docker_machine_inspect.json"
@@ -146,26 +176,9 @@ module Docker =
                     | [|name; value|] -> Some(name.Trim(), value.Trim().Trim('"'))
                     | _ -> None
                 else None
-            exec "docker-machine" "env" [] [] [name]
+            dockerCmd "docker-machine" "env" [] [] [name]
             |> List.choose parseLine
                     
-    module Build =
-
-        type Commands =
-             | NoCache
-             | Remove
-             | Tag of string
-        with
-            interface ICommand with
-                member x.GetString() =
-                    match x with
-                    | NoCache -> "--no-cache"
-                    | Remove -> "--rm"
-                    | Tag tag -> sprintf "--tag %s" tag
-        
-        let exec (options:Commands list) dockerfile = 
-            execRequireMachine "docker" "build" options [dockerfile]
-            
     module Instance = 
     
         let [<Literal>] inspectJson = "docker_instance_inspect.json"
