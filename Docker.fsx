@@ -12,13 +12,18 @@ module Docker =
     [<AutoOpen>]
     module Types =
 
+        type EnvironmentVariable = {
+             Name : string
+             Value : string
+        }
+        
         type LogEntry = {
             Timestamp : DateTimeOffset
             Ordinal : int
             Level : string
             Message : string
         }
-
+        
         type Image = {
             Repository : string option
             Tag : string option
@@ -26,6 +31,17 @@ module Docker =
             ImageId : string
             Created : DateTime
             VirtualSize : float
+        }
+
+        type Command = {
+            WorkingDirectory : string
+            Root : string
+            Cmd : string
+            Env: EnvironmentVariable list
+            Options : string list
+            Args : string list
+            Timeout : TimeSpan
+            RequiresMachine : bool
         }
 
     [<AutoOpen>]
@@ -74,80 +90,152 @@ module Docker =
             match inp.Split(splitChar, StringSplitOptions.RemoveEmptyEntries) |> Array.toList with
             | value :: _ -> Some <|f value
             | _ -> None
-    
-    let mutable cmdTimeout = TimeSpan.FromSeconds(30.)
-    let mutable workingDirectory = __SOURCE_DIRECTORY__
-    let mutable machineEnvironment = None
-        
-    let private assertMachineEnv() =
-        match machineEnvironment with
-        | None -> failwith "machine environment not set, have you created a machine?"
-        | Some x -> x
-        
-    let dockerCmd root cmd envs opts args =
-        let args =
-            sprintf "%s %s" cmd (String.Join(" ",opts @ args))
-        let ok, messages = 
-            ExecProcessRedirected (fun info ->
-                envs |> List.iter (fun (n,v) -> info.EnvironmentVariables.Add(n,v))
-                info.Arguments <- args
-                info.FileName <- root
-                info.WorkingDirectory <- workingDirectory
-            ) cmdTimeout
-        messages |> Seq.map (fun m -> m.Message) |> Seq.toList
-        
-    let dockerCmdRequireMachine root cmd options args =
-        let envs = assertMachineEnv()
-        dockerCmd root cmd envs options args
-    
-    let version() =
-        dockerCmd "docker" "--version" [] [] []
 
-    let logs options name =
-        let parseLine (str:string) =
-            let str = str.Trim()
-            match str.Split([|' '|], StringSplitOptions.RemoveEmptyEntries) |> Array.toList with
-            | (DateTimeOffset date) :: value :: level :: t ->
-                { Timestamp = date; Ordinal = Int32.Parse(value); Level = level; Message = (String.Join(" ", t)) }
-                |> Some  
-            | _ -> None
-        dockerCmdRequireMachine "docker" "logs" options [name]
-        |> List.choose parseLine
+    [<AutoOpen>]
+    module Utils =
 
-    let build options dockerfile = 
-        dockerCmdRequireMachine "docker" "build" options [dockerfile]
+        let getMessage (msg:ConsoleMessage) = Some (msg.Message.Trim())
 
-    let create options image command args =
-        dockerCmdRequireMachine "docker" "create" options [command;args]
-
-    let exec options container command args =
-        dockerCmdRequireMachine "docker" "exec" options [container; command; args]
-
-    let images options =
-        let (title::data) = dockerCmdRequireMachine "docker" "images" options []
-        let indexes =
-            ["REPOSITORY"; "TAG"; "DIGEST"; "IMAGE ID"; "CREATED"; "VIRTUAL SIZE"]
-            |> Seq.map (title.IndexOf)
+        let computeIndices (title:String) (headers:string list) =
+            headers
+            |> Seq.map title.IndexOf
             |> (fun x -> Seq.append x [title.Length - 1])
             |> Seq.filter ((<=) 0)
             |> Seq.pairwise
             |> Seq.toList
 
-        let parseLine (str:string) =
-            let result =  indexes |> List.map (fun (x,y) -> str.Substring(x, (min (str.Length - 1) y) - x).Trim())
-            match result with
-            | [StringOpt rep; StringOpt tag; StringOpt digst; image; Date created; SplitParseFirst [|' '|] float  size] ->
-                Some { Repository = rep; Digest = digst;  Tag = tag; ImageId = image; Created = created; VirtualSize = size }
-            | [StringOpt rep; StringOpt tag; image; Date created; SplitParseFirst [|' '|] float  size] ->
-                Some { Repository = rep; Digest = None;  Tag = tag; ImageId = image; Created = created; VirtualSize = size }
-            | _ -> None
+       
+    let mutable timeout = TimeSpan.FromSeconds(30.)
+    let mutable workingDirectory =  __SOURCE_DIRECTORY__
+    let mutable machineEnvironment = None
+       
+    module Command =
 
-        data
-        |> List.choose parseLine
+        let private assertMachineEnv() =
+            match machineEnvironment with
+            | None -> failwith "machine environment not set, have you created a machine?"
+            | Some x -> x
+
+        let empty() =  {
+            WorkingDirectory  = workingDirectory
+            Root = ""
+            Cmd = ""
+            Env = []
+            Options = []
+            Args = []
+            Timeout = timeout
+            RequiresMachine = false
+        }
+
+        let create root cmd options args =
+            { empty() with
+                Root = root;
+                Cmd = cmd;
+                Options = options;
+                Args = args;
+                RequiresMachine = true  }
+
+        let workingDirectory dir (cmd:Command) =
+            { cmd with WorkingDirectory = dir }
+
+        let noMachineEnv cmd =
+            { cmd with RequiresMachine = false }
+        
+        let run f (cmd:Command) =
+            let args =
+                sprintf "%s %s" cmd.Cmd (String.Join(" ",cmd.Options @ cmd.Args))
+            let envs =
+                if cmd.RequiresMachine
+                then
+                    let es = assertMachineEnv()
+                    es @ cmd.Env
+                else
+                    cmd.Env
+            let ok, messages = 
+                ExecProcessRedirected (fun info ->
+                    envs |> List.iter (fun env -> info.EnvironmentVariables.Add(env.Name,env.Value))
+                    info.Arguments <- args
+                    info.FileName <- cmd.Root
+                    info.WorkingDirectory <- cmd.WorkingDirectory
+                ) cmd.Timeout
+            messages
+            |> Seq.choose f
+            |> Seq.toList
+
+         
+    let attach options container =
+        Command.create "docker" "attach" options container
+        |> Command.run getMessage
+    
+    let build options dockerfile = 
+        Command.create "docker" "build" options [dockerfile]
+        |> Command.run getMessage
+        
+    let commit options container repository tag =
+        match repository, tag with
+        | "", "" | null, null ->
+            Command.create "docker" "commit" options [container]
+        | "", _ | null, _ ->
+            failwithf "Specified a TAG arg with a null or empty REPOSITORY arg"
+        | rep, "" | rep, null ->
+            Command.create "docker" "commit" options [container; rep]
+        | rep, tag ->
+            Command.create "docker" "commit" options [container; sprintf "%s:%s" rep tag]
+        |> Command.run getMessage
+
+    let copy options container local =
+        Command.create "docker" "cp" options [container;local]
+        |> Command.run getMessage
+    
+    let create options image command args =
+        Command.create "docker" "create" options [command;args]
+        |> Command.run getMessage
+
+    let diff options container =
+        Command.create "docker" "diff" options [container]
+        |> Command.run getMessage
+        
+    let exec options container command args =
+        Command.create "docker" "exec" options [container; command; args]
+        |> Command.run getMessage
+        
+    let logs options name =
+        let log (msg:ConsoleMessage) =
+            let str = msg.Message.Trim()
+            match str.Split([|' '|], StringSplitOptions.RemoveEmptyEntries) |> Array.toList with
+            | (DateTimeOffset date) :: value :: level :: t ->
+                { Timestamp = date; Ordinal = Int32.Parse(value); Level = level; Message = (String.Join(" ", t)) }
+                |> Some  
+            | _ -> None  
+       
+        Command.create "docker" "logs" options [name]
+        |> Command.run log
+       
+
+    let images options =
+        match Command.create "docker" "images" options [] |> Command.run getMessage with
+        | [] -> []
+        | title :: data ->             
+            let indexes =
+                ["REPOSITORY"; "TAG"; "DIGEST"; "IMAGE ID"; "CREATED"; "VIRTUAL SIZE"]
+                |> computeIndices title
+
+            let parseLine (str:string) =
+                let result =  indexes |> List.map (fun (x,y) -> str.Substring(x, (min (str.Length - 1) y) - x).Trim())
+                match result with
+                | [StringOpt rep; StringOpt tag; StringOpt digst; image; Date created; SplitParseFirst [|' '|] float  size] ->
+                    Some { Repository = rep; Digest = digst;  Tag = tag; ImageId = image; Created = created; VirtualSize = size }
+                | [StringOpt rep; StringOpt tag; image; Date created; SplitParseFirst [|' '|] float  size] ->
+                    Some { Repository = rep; Digest = None;  Tag = tag; ImageId = image; Created = created; VirtualSize = size }
+                | _ -> None
+
+            data
+            |> List.choose parseLine
 
     let removeImage options image =
-         dockerCmdRequireMachine "docker" "rmi" (options @ [image]) []
-        
+         Command.create "docker" "rmi" (options @ [image]) []
+         |> Command.run getMessage
+         
     let removeImages options images =
         [
             for image in images do
@@ -156,14 +244,17 @@ module Docker =
 
     let removeImagesMatching options f =
         images options
-        |> Seq.filter (fun x -> x.Repository.IsNone && x.Tag.IsNone)
+        |> Seq.filter f
         |> removeImages options
         |> List.concat   
+
+    let version() =
+        Command.create "docker" "--version" [] []
+        |> Command.run getMessage
     
     module Machine =
 
         let [<Literal>] inspectJson = "docker_machine_inspect.json"
-
         type Inspect = JsonProvider<inspectJson>
  
         let inspect machineName = ()
@@ -173,11 +264,12 @@ module Docker =
                 if str.StartsWith("export")
                 then
                     match str.Replace("export", "").Split([|'='|], StringSplitOptions.RemoveEmptyEntries) with
-                    | [|name; value|] -> Some(name.Trim(), value.Trim().Trim('"'))
+                    | [|name; value|] -> Some({Name = name.Trim(); Value = value.Trim().Trim('"') })
                     | _ -> None
                 else None
-            dockerCmd "docker-machine" "env" [] [] [name]
-            |> List.choose parseLine
+            Command.create "docker-machine" "env" [] [name]
+            |> Command.noMachineEnv
+            |> Command.run (getMessage >> Option.bind parseLine)
                     
     module Instance = 
     
