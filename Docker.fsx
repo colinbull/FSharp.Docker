@@ -33,6 +33,14 @@ module Docker =
             VirtualSize : float
         }
 
+        type History = {
+            Image : string
+            Created : DateTime
+            CreatedBy : string
+            Size : float
+            Comment : string
+        }
+
         type Command = {
             WorkingDirectory : string
             Root : string
@@ -66,6 +74,8 @@ module Docker =
             if str.ToLowerInvariant() = "<none>"
             then None
             else Some str
+
+        let (|Trimmed|) (str:string) = str.Trim()
 
         let (|Date|) (str:string) =
             let str = str.Trim()
@@ -198,6 +208,34 @@ module Docker =
     let exec options container command args =
         Command.create "docker" "exec" options [container; command; args]
         |> Command.run getMessage
+
+    let export options container =
+        Command.create "docker" "export" options [container]
+        |> Command.run getMessage
+
+    let history options image =
+        match Command.create "docker" "history" options [image] |> Command.run getMessage with
+        | [] -> []
+        | title :: data ->             
+            let indexes =
+                ["IMAGE"; "CREATED"; "CREATED BY"; "SIZE"; "COMMENT"]
+                |> computeIndices title
+            printfn "Indexes: %A" indexes
+            let parseLine (str:string) =
+                let result =  indexes |> List.map (fun (x,y) ->
+                        let stex = x
+                        let endex = min (str.Length - 1) y
+                        let len = endex - stex
+                        printfn "Start: %d, End: %d, Len: %d" stex endex len
+                        str.Substring(stex,len).Trim())
+                       
+                match result with
+                | [Trimmed image; Date created; Trimmed createdBy;SplitParseFirst [|' '|] float  size; Trimmed comment] ->
+                    Some { Image = image; Created = created; CreatedBy = createdBy; Size = size; Comment = comment; }
+                | _ -> None
+            data
+            |> List.choose parseLine
+
         
     let logs options name =
         let log (msg:ConsoleMessage) =
